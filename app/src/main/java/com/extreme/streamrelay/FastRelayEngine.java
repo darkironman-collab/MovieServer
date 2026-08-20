@@ -20,10 +20,14 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 
-public class RelayEngine {
-    public static final int CHUNK_SIZE = 4 * 1024 * 1024;
-    private static final int PROBE_BYTES = 4096;
+/**
+ * Faster relay engine that uses a HEAD-first metadata probe.
+ * This avoids making Google single-thread links begin a full media GET just to
+ * discover size/type during app startup.
+ */
+public class FastRelayEngine extends RelayEngine {
     private static final long HARD_CACHE_MAX = 2048L * 1024L * 1024L;
+    private static final int PROBE_BYTES = 4096;
 
     private final File cacheDir;
     private final SharedPreferences prefs;
@@ -42,36 +46,36 @@ public class RelayEngine {
     private ExecutorService pool = Executors.newFixedThreadPool(8);
     private long reservedBytes = 0;
 
-    // Used only when the origin ignores Range requests. One persistent upstream
-    // connection is consumed from byte 0 onward while the local server still
-    // exposes normal byte-addressed chunks to the player.
     private HttpURLConnection sequentialConnection;
     private InputStream sequentialInput;
     private long sequentialNextChunkIndex = 0;
     private boolean sequentialEof = false;
 
-    public RelayEngine(Context context) {
+    public FastRelayEngine(Context context) {
+        super(context);
         Context app = context.getApplicationContext();
-        this.cacheDir = new File(app.getCacheDir(), "relay_chunks");
+        cacheDir = new File(app.getCacheDir(), "relay_fast_chunks");
         //noinspection ResultOfMethodCallIgnored
         cacheDir.mkdirs();
-        this.prefs = app.getSharedPreferences("relay", Context.MODE_PRIVATE);
+        prefs = app.getSharedPreferences("relay", Context.MODE_PRIVATE);
     }
 
+    @Override
     public synchronized void configure(String url, long requestedCacheBytes, int threads) throws Exception {
         boolean changed = sourceUrl == null || !sourceUrl.equals(url);
         sourceUrl = url;
         maxCacheBytes = Math.max(CHUNK_SIZE, Math.min(requestedCacheBytes, HARD_CACHE_MAX));
 
-        if (threads != threadCount) {
+        int wantedThreads = Math.max(2, Math.min(threads, 16));
+        if (wantedThreads != threadCount) {
             pool.shutdownNow();
-            threadCount = Math.max(2, Math.min(threads, 16));
+            threadCount = wantedThreads;
             pool = Executors.newFixedThreadPool(threadCount);
             inFlight.clear();
         }
 
         closeSequentialSession();
-        if (changed) clearCache();
+        if (changed) clearFastCache();
 
         sourceLength = -1;
         contentType = "application/octet-stream";
@@ -79,12 +83,12 @@ public class RelayEngine {
         sourceFileName = inferFileName(url);
         sourceExtension = inferExtensionFromName(sourceFileName);
 
-        probeWithRangeGet();
+        fastProbe();
+        finalizeFormat(new byte[0]);
 
-        String streamPath = getStreamPath();
         prefs.edit()
                 .putString("contentType", contentType)
-                .putString("streamPath", streamPath)
+                .putString("streamPath", getStreamPath())
                 .putString("sourceFileName", sourceFileName)
                 .putLong("sourceLength", sourceLength)
                 .putBoolean("rangeSupported", rangeSupported)
@@ -94,28 +98,70 @@ public class RelayEngine {
         updateCacheStats();
     }
 
-    public String getSourceUrl() { return sourceUrl; }
-    public long getSourceLength() { return sourceLength; }
-    public String getContentType() { return contentType; }
-    public boolean isRangeSupported() { return rangeSupported; }
-    public String getSourceFileName() { return sourceFileName; }
-    public long getMaxCacheBytes() { return maxCacheBytes; }
-    public String getRelayMode() { return rangeSupported ? "multi-thread range" : "sequential fallback"; }
+    private void fastProbe() throws Exception {
+        Exception headFailure = null;
+        HttpURLConnection head = null;
+        try {
+            head = openConnection(sourceUrl);
+            head.setRequestMethod("HEAD");
+            head.setConnectTimeout(5000);
+            head.setReadTimeout(5000);
+            int code = head.getResponseCode();
+            if (code >= 200 && code < 400) {
+                captureResponseMetadata(head);
+                String ar = head.getHeaderField("Accept-Ranges");
+                if (ar != null) {
+                    String lower = ar.toLowerCase(Locale.ROOT);
+                    if (lower.contains("bytes")) {
+                        rangeSupported = true;
+                        return;
+                    }
+                    if (lower.contains("none")) {
+                        rangeSupported = false;
+                        return;
+                    }
+                }
 
-    public String getStreamPath() {
-        if (sourceExtension == null || sourceExtension.isEmpty()) return "/stream";
-        return "/stream." + sourceExtension;
+                // Google download hosts are commonly single-stream. If HEAD has
+                // already given us the full size/type, do not start a media GET
+                // merely to test Range support; become ready immediately.
+                if (isGoogleDownloadHost(sourceUrl) && sourceLength > 0) {
+                    rangeSupported = false;
+                    return;
+                }
+
+                // If format and size are already known, use sequential mode right
+                // away for hosts that do not explicitly advertise byte ranges.
+                if (sourceLength > 0 && !"application/octet-stream".equals(contentType)) {
+                    rangeSupported = false;
+                    return;
+                }
+            } else if (code != 405 && code != 403) {
+                throw new IllegalStateException("Upstream HEAD HTTP " + code);
+            }
+        } catch (Exception e) {
+            headFailure = e;
+        } finally {
+            if (head != null) head.disconnect();
+        }
+
+        // Fallback only when HEAD did not provide enough metadata.
+        try {
+            rangeProbeGet();
+        } catch (Exception getFailure) {
+            if (headFailure != null) getFailure.addSuppressed(headFailure);
+            throw getFailure;
+        }
     }
 
-    private void probeWithRangeGet() throws Exception {
+    private void rangeProbeGet() throws Exception {
         HttpURLConnection c = null;
         byte[] prefix = new byte[0];
         try {
             c = openConnection(sourceUrl);
-            c.setConnectTimeout(15000);
-            c.setReadTimeout(15000);
+            c.setConnectTimeout(8000);
+            c.setReadTimeout(8000);
             c.setRequestProperty("Range", "bytes=0-" + (PROBE_BYTES - 1));
-
             int code = c.getResponseCode();
             captureResponseMetadata(c);
 
@@ -124,14 +170,12 @@ public class RelayEngine {
                 String cr = c.getHeaderField("Content-Range");
                 if (cr != null && cr.contains("/")) {
                     String total = cr.substring(cr.lastIndexOf('/') + 1).trim();
-                    if (!"*".equals(total)) sourceLength = parseLong(total, -1);
+                    if (!"*".equals(total)) sourceLength = parseLong(total, sourceLength);
                 }
                 try (InputStream in = c.getInputStream()) {
                     prefix = readPrefix(in, PROBE_BYTES);
                 }
             } else if (code >= 200 && code < 300) {
-                // Origin ignored Range. This is now supported by the sequential
-                // fallback; do not reject large files.
                 rangeSupported = false;
                 sourceLength = parseLong(c.getHeaderField("Content-Length"), sourceLength);
                 try (InputStream in = c.getInputStream()) {
@@ -143,10 +187,25 @@ public class RelayEngine {
         } finally {
             if (c != null) c.disconnect();
         }
+        finalizeFormat(prefix);
+    }
 
+    private boolean isGoogleDownloadHost(String rawUrl) {
+        try {
+            String host = new URL(rawUrl).getHost().toLowerCase(Locale.ROOT);
+            return host.endsWith("googleusercontent.com") ||
+                    host.endsWith("googlevideo.com") ||
+                    host.endsWith("googleapis.com");
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    private void finalizeFormat(byte[] prefix) {
         if (sourceExtension.isEmpty()) sourceExtension = extensionFromContentType(contentType);
-        if (sourceExtension.isEmpty()) sourceExtension = extensionFromMagic(prefix);
-
+        if (sourceExtension.isEmpty() && prefix != null && prefix.length > 0) {
+            sourceExtension = extensionFromMagic(prefix);
+        }
         if (!sourceExtension.isEmpty()) {
             if (inferExtensionFromName(sourceFileName).isEmpty()) {
                 sourceFileName = sourceFileName + "." + sourceExtension;
@@ -157,26 +216,13 @@ public class RelayEngine {
         }
     }
 
-    private byte[] readPrefix(InputStream in, int maxBytes) throws Exception {
-        ByteArrayOutputStream out = new ByteArrayOutputStream(maxBytes);
-        byte[] buf = new byte[1024];
-        int remaining = maxBytes;
-        while (remaining > 0) {
-            int n = in.read(buf, 0, Math.min(buf.length, remaining));
-            if (n < 0) break;
-            out.write(buf, 0, n);
-            remaining -= n;
-        }
-        return out.toByteArray();
-    }
-
     private void captureResponseMetadata(HttpURLConnection c) {
         String ct = c.getContentType();
         if (ct != null && !ct.trim().isEmpty()) {
             contentType = ct.split(";", 2)[0].trim().toLowerCase(Locale.ROOT);
         }
-        long length = parseLong(c.getHeaderField("Content-Length"), -1);
-        if (sourceLength < 0 && length >= 0) sourceLength = length;
+        long len = parseLong(c.getHeaderField("Content-Length"), -1);
+        if (len >= 0) sourceLength = len;
     }
 
     private HttpURLConnection openConnection(String url) throws Exception {
@@ -189,6 +235,20 @@ public class RelayEngine {
         return c;
     }
 
+    @Override public String getSourceUrl() { return sourceUrl; }
+    @Override public long getSourceLength() { return sourceLength; }
+    @Override public String getContentType() { return contentType; }
+    @Override public boolean isRangeSupported() { return rangeSupported; }
+    @Override public String getSourceFileName() { return sourceFileName; }
+    @Override public long getMaxCacheBytes() { return maxCacheBytes; }
+    @Override public String getRelayMode() { return rangeSupported ? "multi-thread range" : "sequential fallback"; }
+
+    @Override
+    public String getStreamPath() {
+        return sourceExtension == null || sourceExtension.isEmpty() ? "/stream" : "/stream." + sourceExtension;
+    }
+
+    @Override
     public File getChunk(long chunkIndex) throws Exception {
         if (sourceUrl == null) throw new IllegalStateException("No source URL configured");
         if (chunkIndex < 0) throw new IllegalArgumentException("Negative chunk index");
@@ -201,11 +261,8 @@ public class RelayEngine {
             return f;
         }
 
-        if (rangeSupported) {
-            downloadRangeChunkBlocking(chunkIndex);
-        } else {
-            downloadSequentialThrough(chunkIndex);
-        }
+        if (rangeSupported) downloadRangeChunkBlocking(chunkIndex);
+        else downloadSequentialThrough(chunkIndex);
 
         f = chunkFile(chunkIndex);
         if (!f.exists() || f.length() <= 0) {
@@ -219,20 +276,13 @@ public class RelayEngine {
 
     private void schedulePrefetch(long first) {
         if (sourceLength > 0 && first * (long) CHUNK_SIZE >= sourceLength) return;
-
         if (!rangeSupported) {
-            // No true parallelism is possible if the origin ignores Range.
-            // Still keep one chunk warm ahead of the player using the same
-            // sequential connection.
             File next = chunkFile(first);
             if (next.exists()) return;
             inFlight.computeIfAbsent(first, k -> pool.submit(() -> {
-                try {
-                    downloadSequentialThrough(k);
-                } catch (Exception ignored) {
-                } finally {
-                    inFlight.remove(k);
-                }
+                try { downloadSequentialThrough(k); }
+                catch (Exception ignored) {}
+                finally { inFlight.remove(k); }
             }));
             return;
         }
@@ -244,12 +294,9 @@ public class RelayEngine {
             File f = chunkFile(idx);
             if (f.exists()) continue;
             inFlight.computeIfAbsent(idx, k -> pool.submit(() -> {
-                try {
-                    downloadRangeChunkBlocking(k);
-                } catch (Exception ignored) {
-                } finally {
-                    inFlight.remove(k);
-                }
+                try { downloadRangeChunkBlocking(k); }
+                catch (Exception ignored) {}
+                finally { inFlight.remove(k); }
             }));
         }
     }
@@ -258,46 +305,34 @@ public class RelayEngine {
         File finalFile = chunkFile(chunkIndex);
         if (finalFile.exists() && finalFile.length() > 0) return;
 
-        synchronized (("range-chunk-" + chunkIndex).intern()) {
+        synchronized (("fast-range-" + chunkIndex).intern()) {
             if (finalFile.exists() && finalFile.length() > 0) return;
-
             long start = chunkIndex * (long) CHUNK_SIZE;
             long end = start + CHUNK_SIZE - 1;
             if (sourceLength > 0) end = Math.min(end, sourceLength - 1);
-            if (sourceLength > 0 && start >= sourceLength) {
-                throw new IllegalArgumentException("Requested range is past end of file");
-            }
+            if (sourceLength > 0 && start >= sourceLength) throw new IllegalArgumentException("Requested range is past end of file");
 
             long expectedBytes = end - start + 1;
             reserveSpace(expectedBytes);
             HttpURLConnection c = null;
             File tmp = new File(cacheDir, chunkIndex + ".part");
-
             try {
                 c = openConnection(sourceUrl);
-                c.setConnectTimeout(15000);
+                c.setConnectTimeout(12000);
                 c.setReadTimeout(45000);
                 c.setRequestProperty("Range", "bytes=" + start + "-" + end);
-
                 int code = c.getResponseCode();
                 captureResponseMetadata(c);
-                if (code != 206) {
-                    throw new IllegalStateException("Upstream stopped honoring byte ranges (HTTP " + code + ")");
-                }
-
+                if (code != 206) throw new IllegalStateException("Upstream stopped honoring byte ranges (HTTP " + code + ")");
                 long written;
                 try (InputStream in = c.getInputStream(); FileOutputStream out = new FileOutputStream(tmp)) {
                     written = copyAtMost(in, out, expectedBytes);
                 }
-
                 if (written <= 0) throw new IllegalStateException("Upstream returned no media data");
                 commitTemp(tmp, finalFile);
             } finally {
                 if (c != null) c.disconnect();
-                if (tmp.exists()) {
-                    //noinspection ResultOfMethodCallIgnored
-                    tmp.delete();
-                }
+                if (tmp.exists()) tmp.delete();
                 releaseSpace(expectedBytes);
                 enforceCacheLimit();
                 updateCacheStats();
@@ -312,40 +347,25 @@ public class RelayEngine {
         synchronized (sequentialLock) {
             target = chunkFile(targetChunkIndex);
             if (target.exists() && target.length() > 0) return;
-
-            // If the player asks for an older chunk that has already been
-            // evicted from the rolling cache, restart the non-range source at
-            // byte 0 and advance sequentially. This is slower than true Range
-            // seeking, but it keeps playback compatible with non-range hosts.
-            if (targetChunkIndex < sequentialNextChunkIndex) {
-                closeSequentialSessionLocked();
-            }
-
+            if (targetChunkIndex < sequentialNextChunkIndex) closeSequentialSessionLocked();
             ensureSequentialSessionLocked();
 
             while (sequentialNextChunkIndex <= targetChunkIndex) {
                 long idx = sequentialNextChunkIndex;
                 long start = idx * (long) CHUNK_SIZE;
-
                 if (sourceLength > 0 && start >= sourceLength) {
                     sequentialEof = true;
                     closeSequentialSessionLocked();
                     break;
                 }
 
-                long expectedBytes = sourceLength > 0
-                        ? Math.min((long) CHUNK_SIZE, sourceLength - start)
-                        : CHUNK_SIZE;
-
+                long expectedBytes = sourceLength > 0 ? Math.min((long) CHUNK_SIZE, sourceLength - start) : CHUNK_SIZE;
                 reserveSpace(expectedBytes);
                 File tmp = new File(cacheDir, idx + ".part");
                 File finalFile = chunkFile(idx);
                 long written = 0;
-
                 try {
                     if (finalFile.exists() && finalFile.length() > 0) {
-                        // The upstream stream still has to advance over these
-                        // bytes to keep its position aligned.
                         written = discardAtMost(sequentialInput, expectedBytes);
                     } else {
                         try (FileOutputStream out = new FileOutputStream(tmp)) {
@@ -365,7 +385,6 @@ public class RelayEngine {
                     }
 
                     sequentialNextChunkIndex++;
-
                     if (written < expectedBytes) {
                         sourceLength = start + written;
                         prefs.edit().putLong("sourceLength", sourceLength).apply();
@@ -374,10 +393,7 @@ public class RelayEngine {
                         break;
                     }
                 } finally {
-                    if (tmp.exists()) {
-                        //noinspection ResultOfMethodCallIgnored
-                        tmp.delete();
-                    }
+                    if (tmp.exists()) tmp.delete();
                     releaseSpace(expectedBytes);
                     enforceCacheLimit();
                     updateCacheStats();
@@ -394,9 +410,8 @@ public class RelayEngine {
 
     private void ensureSequentialSessionLocked() throws Exception {
         if (sequentialInput != null) return;
-
         sequentialConnection = openConnection(sourceUrl);
-        sequentialConnection.setConnectTimeout(15000);
+        sequentialConnection.setConnectTimeout(12000);
         sequentialConnection.setReadTimeout(60000);
         int code = sequentialConnection.getResponseCode();
         captureResponseMetadata(sequentialConnection);
@@ -405,27 +420,18 @@ public class RelayEngine {
             closeSequentialSessionLocked();
             throw new IllegalStateException(detail);
         }
-
         sequentialInput = sequentialConnection.getInputStream();
         sequentialNextChunkIndex = 0;
         sequentialEof = false;
     }
 
     private void closeSequentialSession() {
-        synchronized (sequentialLock) {
-            closeSequentialSessionLocked();
-        }
+        synchronized (sequentialLock) { closeSequentialSessionLocked(); }
     }
 
     private void closeSequentialSessionLocked() {
-        try {
-            if (sequentialInput != null) sequentialInput.close();
-        } catch (Exception ignored) {
-        }
-        try {
-            if (sequentialConnection != null) sequentialConnection.disconnect();
-        } catch (Exception ignored) {
-        }
+        try { if (sequentialInput != null) sequentialInput.close(); } catch (Exception ignored) {}
+        try { if (sequentialConnection != null) sequentialConnection.disconnect(); } catch (Exception ignored) {}
         sequentialInput = null;
         sequentialConnection = null;
         sequentialNextChunkIndex = 0;
@@ -461,20 +467,16 @@ public class RelayEngine {
 
     private void commitTemp(File tmp, File finalFile) throws Exception {
         if (tmp.length() <= 0) throw new IllegalStateException("Upstream returned no media data");
-        //noinspection ResultOfMethodCallIgnored
         finalFile.delete();
         if (!tmp.renameTo(finalFile)) throw new IllegalStateException("Cannot commit cache chunk");
-        //noinspection ResultOfMethodCallIgnored
         finalFile.setLastModified(System.currentTimeMillis());
     }
 
-    private File chunkFile(long index) {
-        return new File(cacheDir, index + ".chunk");
-    }
+    private File chunkFile(long index) { return new File(cacheDir, index + ".chunk"); }
 
     private synchronized void reserveSpace(long bytes) {
         if (bytes > maxCacheBytes) throw new IllegalStateException("Chunk larger than cache limit");
-        evictUntil(cacheSize() + reservedBytes + bytes <= maxCacheBytes, bytes);
+        evictUntil(cacheSizeFast() + reservedBytes + bytes <= maxCacheBytes, bytes);
         reservedBytes += bytes;
     }
 
@@ -484,7 +486,7 @@ public class RelayEngine {
     }
 
     private synchronized void enforceCacheLimit() {
-        evictUntil(cacheSize() <= maxCacheBytes, 0);
+        evictUntil(cacheSizeFast() <= maxCacheBytes, 0);
     }
 
     private void evictUntil(boolean alreadyFits, long incomingBytes) {
@@ -492,56 +494,54 @@ public class RelayEngine {
         List<File> files = new ArrayList<>();
         File[] all = cacheDir.listFiles((dir, name) -> name.endsWith(".chunk"));
         if (all == null) return;
-
         long total = 0;
-        for (File f : all) {
-            files.add(f);
-            total += f.length();
-        }
+        for (File f : all) { files.add(f); total += f.length(); }
         files.sort(Comparator.comparingLong(File::lastModified));
-
         for (File f : files) {
             if (total + reservedBytes + incomingBytes <= maxCacheBytes) break;
             long len = f.length();
             if (f.delete()) total -= len;
         }
-
         if (total + reservedBytes + incomingBytes > maxCacheBytes) {
             throw new IllegalStateException("Cache is busy; retry playback in a moment");
         }
     }
 
-    public long cacheSize() {
+    private long cacheSizeFast() {
         long total = 0;
         File[] all = cacheDir.listFiles((dir, name) -> name.endsWith(".chunk"));
-        if (all != null) {
-            for (File f : all) total += f.length();
-        }
+        if (all != null) for (File f : all) total += f.length();
         return total;
     }
 
     private void updateCacheStats() {
-        prefs.edit()
-                .putLong("cacheUsed", cacheSize())
-                .putLong("cacheMax", maxCacheBytes)
-                .apply();
+        prefs.edit().putLong("cacheUsed", cacheSizeFast()).putLong("cacheMax", maxCacheBytes).apply();
     }
 
-    public synchronized void clearCache() {
+    private void clearFastCache() {
         File[] files = cacheDir.listFiles();
-        if (files != null) {
-            for (File f : files) {
-                //noinspection ResultOfMethodCallIgnored
-                f.delete();
-            }
-        }
+        if (files != null) for (File f : files) f.delete();
         updateCacheStats();
     }
 
+    @Override
     public void close() {
         closeSequentialSession();
         pool.shutdownNow();
         inFlight.clear();
+    }
+
+    private byte[] readPrefix(InputStream in, int maxBytes) throws Exception {
+        ByteArrayOutputStream out = new ByteArrayOutputStream(maxBytes);
+        byte[] buf = new byte[1024];
+        int remaining = maxBytes;
+        while (remaining > 0) {
+            int n = in.read(buf, 0, Math.min(buf.length, remaining));
+            if (n < 0) break;
+            out.write(buf, 0, n);
+            remaining -= n;
+        }
+        return out.toByteArray();
     }
 
     private String inferFileName(String rawUrl) {
@@ -552,8 +552,7 @@ public class RelayEngine {
                 String name = slash >= 0 ? path.substring(slash + 1) : path;
                 if (!name.isEmpty()) return sanitizeFileName(name);
             }
-        } catch (Exception ignored) {
-        }
+        } catch (Exception ignored) {}
         return "stream";
     }
 
@@ -569,17 +568,15 @@ public class RelayEngine {
         String ext = name.substring(dot + 1).toLowerCase(Locale.ROOT);
         switch (ext) {
             case "mkv": case "mp4": case "m4v": case "webm": case "avi":
-            case "mov": case "ts": case "m2ts": case "mpg": case "mpeg":
-                return ext;
-            default:
-                return "";
+            case "mov": case "ts": case "m2ts": case "mpg": case "mpeg": return ext;
+            default: return "";
         }
     }
 
     private String extensionFromContentType(String type) {
         if (type == null) return "";
         String t = type.toLowerCase(Locale.ROOT);
-        if (t.contains("matroska")) return "mkv";
+        if (t.contains("matroska") || t.contains("video/mkv")) return "mkv";
         if (t.contains("video/mp4") || t.contains("application/mp4")) return "mp4";
         if (t.contains("webm")) return "webm";
         if (t.contains("quicktime")) return "mov";
@@ -590,26 +587,19 @@ public class RelayEngine {
 
     private String extensionFromMagic(byte[] b) {
         if (b == null || b.length < 4) return "";
-
-        if ((b[0] & 0xff) == 0x1A && (b[1] & 0xff) == 0x45 &&
-                (b[2] & 0xff) == 0xDF && (b[3] & 0xff) == 0xA3) {
+        if ((b[0] & 0xff) == 0x1A && (b[1] & 0xff) == 0x45 && (b[2] & 0xff) == 0xDF && (b[3] & 0xff) == 0xA3) {
             String text = new String(b, StandardCharsets.ISO_8859_1).toLowerCase(Locale.ROOT);
             return text.contains("webm") ? "webm" : "mkv";
         }
-
         if (b.length >= 12 && asciiEquals(b, 4, "ftyp")) return "mp4";
         if (b.length >= 12 && asciiEquals(b, 0, "RIFF") && asciiEquals(b, 8, "AVI ")) return "avi";
-        if (b.length >= 8 && asciiEquals(b, 4, "moov")) return "mov";
-        if (b.length >= 3 && (b[0] & 0xff) == 0x00 && (b[1] & 0xff) == 0x00 && (b[2] & 0xff) == 0x01) return "mpeg";
         if (b.length >= 377 && (b[0] & 0xff) == 0x47 && (b[188] & 0xff) == 0x47 && (b[376] & 0xff) == 0x47) return "ts";
         return "";
     }
 
     private boolean asciiEquals(byte[] b, int offset, String s) {
         if (offset < 0 || offset + s.length() > b.length) return false;
-        for (int i = 0; i < s.length(); i++) {
-            if ((byte) s.charAt(i) != b[offset + i]) return false;
-        }
+        for (int i = 0; i < s.length(); i++) if ((byte) s.charAt(i) != b[offset + i]) return false;
         return true;
     }
 
@@ -641,16 +631,11 @@ public class RelayEngine {
             }
             String text = out.toString("UTF-8").replaceAll("\\s+", " ").trim();
             return text.isEmpty() ? "" : ": " + text;
-        } catch (Exception ignored) {
-            return "";
-        }
+        } catch (Exception ignored) { return ""; }
     }
 
     private static long parseLong(String s, long fallback) {
-        try {
-            return Long.parseLong(s);
-        } catch (Exception e) {
-            return fallback;
-        }
+        try { return Long.parseLong(s); }
+        catch (Exception e) { return fallback; }
     }
 }
