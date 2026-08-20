@@ -57,7 +57,7 @@ public class RelayService extends Service {
 
     private void startOrUpdateRelay(String url, long cacheBytes, int threads) {
         try {
-            if (engine == null) engine = new RelayEngine(this);
+            if (engine == null) engine = new FastRelayEngine(this);
             engine.configure(url, cacheBytes, threads);
 
             if (server == null) {
@@ -147,7 +147,7 @@ public class RelayService extends Service {
                 PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE
         );
         return new NotificationCompat.Builder(this, CHANNEL_ID)
-                .setSmallIcon(android.R.drawable.stat_sys_download_done)
+                .setSmallIcon(R.drawable.ic_relay_status)
                 .setContentTitle("Extreme Stream Relay")
                 .setContentText(text)
                 .setOngoing(true)
