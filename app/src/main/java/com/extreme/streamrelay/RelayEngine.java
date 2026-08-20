@@ -9,6 +9,7 @@ import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
@@ -21,6 +22,7 @@ import java.util.concurrent.Future;
 
 public class RelayEngine {
     public static final int CHUNK_SIZE = 4 * 1024 * 1024;
+    private static final int PROBE_BYTES = 4096;
 
     private final File cacheDir;
     private final SharedPreferences prefs;
@@ -70,10 +72,6 @@ public class RelayEngine {
             throw new IllegalStateException("Source server does not support HTTP byte ranges. Multi-thread relay requires Range support.");
         }
 
-        if (sourceExtension.isEmpty()) {
-            sourceExtension = extensionFromContentType(contentType);
-        }
-
         String streamPath = getStreamPath();
         prefs.edit()
                 .putString("contentType", contentType)
@@ -98,11 +96,12 @@ public class RelayEngine {
 
     private void probeWithRangeGet() throws Exception {
         HttpURLConnection c = null;
+        byte[] prefix = new byte[0];
         try {
             c = openConnection(sourceUrl);
             c.setConnectTimeout(15000);
             c.setReadTimeout(15000);
-            c.setRequestProperty("Range", "bytes=0-0");
+            c.setRequestProperty("Range", "bytes=0-" + (PROBE_BYTES - 1));
 
             int code = c.getResponseCode();
             captureResponseMetadata(c);
@@ -115,25 +114,45 @@ public class RelayEngine {
                     if (!"*".equals(total)) sourceLength = parseLong(total, -1);
                 }
                 try (InputStream in = c.getInputStream()) {
-                    in.read();
+                    prefix = readPrefix(in, PROBE_BYTES);
                 }
-                return;
-            }
-
-            if (code >= 200 && code < 300) {
+            } else if (code >= 200 && code < 300) {
                 rangeSupported = false;
                 sourceLength = parseLong(c.getHeaderField("Content-Length"), sourceLength);
                 try (InputStream in = c.getInputStream()) {
-                    byte[] one = new byte[1];
-                    in.read(one);
+                    prefix = readPrefix(in, PROBE_BYTES);
                 }
-                return;
+            } else {
+                throw new IllegalStateException("Upstream HTTP " + code + errorSuffix(c));
             }
-
-            throw new IllegalStateException("Upstream HTTP " + code + errorSuffix(c));
         } finally {
             if (c != null) c.disconnect();
         }
+
+        if (sourceExtension.isEmpty()) sourceExtension = extensionFromContentType(contentType);
+        if (sourceExtension.isEmpty()) sourceExtension = extensionFromMagic(prefix);
+
+        if (!sourceExtension.isEmpty()) {
+            if (inferExtensionFromName(sourceFileName).isEmpty()) {
+                sourceFileName = sourceFileName + "." + sourceExtension;
+            }
+            if ("application/octet-stream".equals(contentType) || contentType.isEmpty()) {
+                contentType = contentTypeFromExtension(sourceExtension);
+            }
+        }
+    }
+
+    private byte[] readPrefix(InputStream in, int maxBytes) throws Exception {
+        ByteArrayOutputStream out = new ByteArrayOutputStream(maxBytes);
+        byte[] buf = new byte[1024];
+        int remaining = maxBytes;
+        while (remaining > 0) {
+            int n = in.read(buf, 0, Math.min(buf.length, remaining));
+            if (n < 0) break;
+            out.write(buf, 0, n);
+            remaining -= n;
+        }
+        return out.toByteArray();
     }
 
     private void captureResponseMetadata(HttpURLConnection c) {
@@ -198,7 +217,9 @@ public class RelayEngine {
             long start = chunkIndex * (long) CHUNK_SIZE;
             long end = start + CHUNK_SIZE - 1;
             if (sourceLength > 0) end = Math.min(end, sourceLength - 1);
-            if (sourceLength > 0 && start >= sourceLength) throw new IllegalArgumentException("Requested range is past end of file");
+            if (sourceLength > 0 && start >= sourceLength) {
+                throw new IllegalArgumentException("Requested range is past end of file");
+            }
 
             long expectedBytes = end - start + 1;
             reserveSpace(expectedBytes);
@@ -360,6 +381,45 @@ public class RelayEngine {
         if (t.contains("mp2t") || t.contains("mpegts")) return "ts";
         if (t.contains("x-msvideo")) return "avi";
         return "";
+    }
+
+    private String extensionFromMagic(byte[] b) {
+        if (b == null || b.length < 4) return "";
+
+        if ((b[0] & 0xff) == 0x1A && (b[1] & 0xff) == 0x45 &&
+                (b[2] & 0xff) == 0xDF && (b[3] & 0xff) == 0xA3) {
+            String text = new String(b, StandardCharsets.ISO_8859_1).toLowerCase(Locale.ROOT);
+            return text.contains("webm") ? "webm" : "mkv";
+        }
+
+        if (b.length >= 12 && asciiEquals(b, 4, "ftyp")) return "mp4";
+        if (b.length >= 12 && asciiEquals(b, 0, "RIFF") && asciiEquals(b, 8, "AVI ")) return "avi";
+        if (b.length >= 8 && asciiEquals(b, 4, "moov")) return "mov";
+        if (b.length >= 3 && (b[0] & 0xff) == 0x00 && (b[1] & 0xff) == 0x00 && (b[2] & 0xff) == 0x01) return "mpeg";
+        if (b.length >= 377 && (b[0] & 0xff) == 0x47 && (b[188] & 0xff) == 0x47 && (b[376] & 0xff) == 0x47) return "ts";
+        return "";
+    }
+
+    private boolean asciiEquals(byte[] b, int offset, String s) {
+        byte[] target = s.getBytes(StandardCharsets.US_ASCII);
+        if (offset < 0 || offset + target.length > b.length) return false;
+        for (int i = 0; i < target.length; i++) {
+            if (b[offset + i] != target[i]) return false;
+        }
+        return true;
+    }
+
+    private String contentTypeFromExtension(String ext) {
+        switch (ext) {
+            case "mkv": return "video/x-matroska";
+            case "mp4": case "m4v": return "video/mp4";
+            case "webm": return "video/webm";
+            case "avi": return "video/x-msvideo";
+            case "mov": return "video/quicktime";
+            case "ts": case "m2ts": return "video/mp2t";
+            case "mpg": case "mpeg": return "video/mpeg";
+            default: return "application/octet-stream";
+        }
     }
 
     private String errorSuffix(HttpURLConnection c) {
