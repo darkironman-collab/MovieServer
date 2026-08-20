@@ -1,0 +1,1 @@
+Validate the direct original-format relay fix with GitHub Actions.
