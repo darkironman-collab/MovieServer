@@ -13,15 +13,15 @@
         <TextView
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="Mobile → Laptop Relay"
-            android:textSize="22sp"
+            android:text="Extreme Stream Relay"
+            android:textSize="28sp"
             android:textStyle="bold" />
 
         <TextView
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:layout_marginTop="6dp"
-            android:text="Paste a direct HTTP/HTTPS MKV or media URL. The laptop plays through this phone over the same Wi-Fi." />
+            android:text="Paste a direct HTTP/HTTPS movie URL. The phone downloads/caches it and serves the original media bytes to your laptop over the same Wi-Fi." />
 
         <EditText
             android:id="@+id/urlInput"
@@ -95,32 +95,38 @@
             android:textStyle="bold" />
 
         <TextView
-            android:id="@+id/m3uUrlText"
+            android:id="@+id/sourceInfoText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="Source: --" />
+
+        <TextView
+            android:id="@+id/directUrlText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:text="Direct Stream URL: --"
+            android:textIsSelectable="true"
+            android:textStyle="bold" />
+
+        <Button
+            android:id="@+id/copyDirectButton"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Copy Direct Stream URL" />
+
+        <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="14dp"
-            android:text="M3U URL: --"
-            android:textIsSelectable="true" />
-
-        <Button
-            android:id="@+id/copyM3uButton"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:text="Copy Permanent M3U URL" />
-
-        <TextView
-            android:id="@+id/playUrlText"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="10dp"
-            android:text="Play URL: --"
-            android:textIsSelectable="true" />
+            android:text="Use this direct URL in Energy Media Player. No M3U wrapper and no transcoding: MKV/MP4/WebM data stays in its original container." />
 
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="18dp"
-            android:text="Tip: Reserve the phone's Wi-Fi IP in your router for a truly permanent laptop playlist URL. The .m3u endpoint itself stays /permanent.m3u." />
+            android:layout_marginTop="12dp"
+            android:text="Tip: Reserve the phone's Wi-Fi IP in your router if you want the laptop URL to remain unchanged after reconnecting to Wi-Fi." />
 
     </LinearLayout>
 </ScrollView>
