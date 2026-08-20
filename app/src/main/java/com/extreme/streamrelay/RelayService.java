@@ -50,7 +50,6 @@ public class RelayService extends Service {
 
             prefs.edit().putString("status", "connecting...").apply();
             updateNotification("Connecting to source...");
-
             worker.submit(() -> startOrUpdateRelay(url, cacheBytes, threads));
         }
         return START_STICKY;
@@ -70,17 +69,26 @@ public class RelayService extends Service {
                     ? engine.getStreamPath().substring(engine.getStreamPath().lastIndexOf('.') + 1).toUpperCase()
                     : "ORIGINAL";
 
+            String mode = engine.isRangeSupported()
+                    ? "Multi-thread Range"
+                    : "Sequential fallback";
+
+            String runningStatus = engine.isRangeSupported()
+                    ? "running • multi-thread mode"
+                    : "running • sequential fallback (source has no Range)";
+
             prefs.edit()
-                    .putString("status", "running on port " + RelayHttpServer.PORT)
-                    .putLong("cacheMax", cacheBytes)
+                    .putString("status", runningStatus)
+                    .putLong("cacheMax", engine.getMaxCacheBytes())
                     .putString("streamPath", engine.getStreamPath())
                     .putString("contentType", engine.getContentType())
                     .putString("format", format)
+                    .putString("relayMode", mode)
                     .putLong("sourceLength", engine.getSourceLength())
                     .putBoolean("rangeSupported", engine.isRangeSupported())
                     .apply();
 
-            updateNotification("Relay active • " + format);
+            updateNotification("Relay active • " + format + " • " + mode);
         } catch (Throwable e) {
             String detail = describeError(e);
             prefs.edit().putString("status", "error: " + detail).apply();
@@ -95,7 +103,6 @@ public class RelayService extends Service {
         String name = root.getClass().getSimpleName();
         if (name == null || name.trim().isEmpty()) name = root.getClass().getName();
         String msg = root.getMessage();
-
         if (msg == null || msg.trim().isEmpty()) return name;
         return name + ": " + msg.trim();
     }
