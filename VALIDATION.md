@@ -1,1 +1,0 @@
-Android CI validation pending.
