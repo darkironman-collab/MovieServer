@@ -107,9 +107,18 @@ public class RelayHttpServer {
                 return;
             }
 
-            serveMedia(out, headers.get("range"), "HEAD".equals(method));
+            if (engine.isRangeSupported()) {
+                serveRangeCapableMedia(out, headers.get("range"), "HEAD".equals(method));
+            } else {
+                // IMPORTANT: the upstream origin itself cannot seek. Do not lie to
+                // the PC player by advertising Range support. Give the player the
+                // complete file size, but always deliver a progressive 200 response
+                // from byte zero. This prevents player tail-probes from forcing the
+                // phone to download gigabytes before playback can start.
+                serveProgressiveMedia(out, "HEAD".equals(method));
+            }
         } catch (Exception ignored) {
-            // Client may disconnect while seeking; no service-level failure is needed.
+            // Player disconnects/reopens sockets during probing and startup.
         }
     }
 
@@ -119,7 +128,57 @@ public class RelayHttpServer {
         return path.startsWith("/stream.");
     }
 
-    private void serveMedia(OutputStream out, String range, boolean headOnly) throws Exception {
+    private void serveProgressiveMedia(OutputStream out, boolean headOnly) throws Exception {
+        long length = engine.getSourceLength();
+
+        StringBuilder h = new StringBuilder();
+        h.append("HTTP/1.1 200 OK\r\n");
+        h.append("Content-Type: ").append(engine.getContentType()).append("\r\n");
+        h.append("Accept-Ranges: none\r\n");
+        h.append("Cache-Control: no-store\r\n");
+        h.append("Content-Disposition: inline; filename=\"")
+                .append(safeHeaderFileName(engine.getSourceFileName()))
+                .append("\"\r\n");
+        if (length > 0) h.append("Content-Length: ").append(length).append("\r\n");
+        h.append("Connection: close\r\n\r\n");
+
+        out.write(h.toString().getBytes(StandardCharsets.US_ASCII));
+        if (headOnly) {
+            out.flush();
+            return;
+        }
+
+        // Always start at byte 0 in non-range mode. The phone reads the Internet
+        // source sequentially and serves it over LAN while the rolling cache stays
+        // capped by the user's selected cache size (hard max 2 GB).
+        long pos = 0;
+        while (length <= 0 || pos < length) {
+            long chunkIndex = pos / RelayEngine.CHUNK_SIZE;
+            File chunk = engine.getChunk(chunkIndex);
+            long available = chunk.length();
+            if (available <= 0) break;
+
+            try (FileInputStream fis = new FileInputStream(chunk)) {
+                byte[] buf = new byte[128 * 1024];
+                int n;
+                while ((n = fis.read(buf)) >= 0) {
+                    if (n == 0) continue;
+                    if (length > 0 && pos + n > length) {
+                        n = (int) (length - pos);
+                        if (n <= 0) break;
+                    }
+                    out.write(buf, 0, n);
+                    pos += n;
+                    if (length > 0 && pos >= length) break;
+                }
+                out.flush();
+            }
+
+            if (available < RelayEngine.CHUNK_SIZE) break;
+        }
+    }
+
+    private void serveRangeCapableMedia(OutputStream out, String range, boolean headOnly) throws Exception {
         long length = engine.getSourceLength();
         long start = 0;
         long end = length > 0 ? length - 1 : Long.MAX_VALUE;
