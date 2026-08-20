@@ -1,8 +1,9 @@
 <resources xmlns:tools="http://schemas.android.com/tools">
-    <style name="Theme.ExtremeStreamRelay" parent="Theme.MaterialComponents.DayNight.DarkActionBar">
+    <style name="Theme.ExtremeStreamRelay" parent="Theme.MaterialComponents.DayNight.NoActionBar">
         <item name="colorPrimary">#6750A4</item>
         <item name="colorPrimaryVariant">#4F378B</item>
         <item name="colorOnPrimary">#FFFFFF</item>
         <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowActionModeOverlay">true</item>
     </style>
 </resources>
