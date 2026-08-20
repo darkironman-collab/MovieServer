@@ -25,12 +25,13 @@ import androidx.core.content.ContextCompat;
 
 import java.util.Arrays;
 import java.util.List;
+import java.util.Locale;
 
 public class MainActivity extends AppCompatActivity {
     private EditText urlInput;
     private CheckBox autoPaste, autoStart;
     private Spinner cacheSpinner, threadSpinner;
-    private TextView statusText, m3uUrlText, playUrlText;
+    private TextView statusText, sourceInfoText, directUrlText;
     private SharedPreferences prefs;
     private String lastClipboardUrl = "";
     private final Handler handler = new Handler(Looper.getMainLooper());
@@ -54,15 +55,17 @@ public class MainActivity extends AppCompatActivity {
         cacheSpinner = findViewById(R.id.cacheSpinner);
         threadSpinner = findViewById(R.id.threadSpinner);
         statusText = findViewById(R.id.statusText);
-        m3uUrlText = findViewById(R.id.m3uUrlText);
-        playUrlText = findViewById(R.id.playUrlText);
+        sourceInfoText = findViewById(R.id.sourceInfoText);
+        directUrlText = findViewById(R.id.directUrlText);
+
         Button pasteButton = findViewById(R.id.pasteButton);
         Button startButton = findViewById(R.id.startButton);
         Button stopButton = findViewById(R.id.stopButton);
-        Button copyM3uButton = findViewById(R.id.copyM3uButton);
+        Button copyDirectButton = findViewById(R.id.copyDirectButton);
 
         List<String> cacheChoices = Arrays.asList("256 MB", "512 MB", "1 GB", "1.5 GB", "2 GB");
         cacheSpinner.setAdapter(new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item, cacheChoices));
+
         List<String> threadChoices = Arrays.asList("2", "4", "8", "12", "16");
         threadSpinner.setAdapter(new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item, threadChoices));
 
@@ -79,9 +82,10 @@ public class MainActivity extends AppCompatActivity {
             prefs.edit().putString("status", "stopped").apply();
             refreshStatus();
         });
-        copyM3uButton.setOnClickListener(v -> copyM3uUrl());
+        copyDirectButton.setOnClickListener(v -> copyDirectUrl());
 
-        if (Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+        if (Build.VERSION.SDK_INT >= 33 &&
+                ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
             ActivityCompat.requestPermissions(this, new String[]{Manifest.permission.POST_NOTIFICATIONS}, 100);
         }
     }
@@ -89,6 +93,7 @@ public class MainActivity extends AppCompatActivity {
     @Override protected void onResume() {
         super.onResume();
         if (autoPaste.isChecked()) pasteFromClipboard(true);
+        handler.removeCallbacks(statusRefresh);
         handler.post(statusRefresh);
     }
 
@@ -105,11 +110,15 @@ public class MainActivity extends AppCompatActivity {
         if (clip == null || clip.getItemCount() == 0) return;
         CharSequence text = clip.getItemAt(0).coerceToText(this);
         if (text == null) return;
+
         String s = text.toString().trim();
         if (!isValidHttpUrl(s)) {
-            if (!auto) Toast.makeText(this, "Clipboard does not contain a valid HTTP/HTTPS URL", Toast.LENGTH_SHORT).show();
+            if (!auto) {
+                Toast.makeText(this, "Clipboard does not contain a valid HTTP/HTTPS URL", Toast.LENGTH_SHORT).show();
+            }
             return;
         }
+
         if (auto && s.equals(lastClipboardUrl)) return;
         lastClipboardUrl = s;
         urlInput.setText(s);
@@ -133,7 +142,9 @@ public class MainActivity extends AppCompatActivity {
 
     private int selectedThreads() {
         int[] values = {2, 4, 8, 12, 16};
-        return values[threadSpinner.getSelectedItemPosition()];
+        int index = threadSpinner.getSelectedItemPosition();
+        if (index < 0 || index >= values.length) return 8;
+        return values[index];
     }
 
     private void startRelay() {
@@ -142,14 +153,21 @@ public class MainActivity extends AppCompatActivity {
             Toast.makeText(this, "Paste a valid HTTP/HTTPS media URL", Toast.LENGTH_LONG).show();
             return;
         }
+
         saveUiPrefs();
+        prefs.edit()
+                .putString("status", "starting...")
+                .putString("streamPath", guessStreamPath(url))
+                .apply();
+        refreshStatus();
+
         Intent i = new Intent(this, RelayService.class);
         i.setAction(RelayService.ACTION_START_OR_UPDATE);
         i.putExtra("url", url);
         i.putExtra("cacheBytes", selectedCacheBytes());
         i.putExtra("threads", selectedThreads());
         ContextCompat.startForegroundService(this, i);
-        Toast.makeText(this, "Relay started/updated", Toast.LENGTH_SHORT).show();
+        Toast.makeText(this, "Connecting to source...", Toast.LENGTH_SHORT).show();
     }
 
     private void saveUiPrefs() {
@@ -165,26 +183,72 @@ public class MainActivity extends AppCompatActivity {
     private void refreshStatus() {
         String ip = NetworkUtils.getLocalIpv4();
         String base = ip == null ? null : "http://" + ip + ":" + RelayHttpServer.PORT;
-        statusText.setText("Status: " + prefs.getString("status", "stopped") + "\nCache: " + humanBytes(prefs.getLong("cacheUsed", 0)) + " / " + humanBytes(prefs.getLong("cacheMax", selectedCacheBytes())));
-        m3uUrlText.setText("M3U URL: " + (base == null ? "Connect phone to Wi-Fi" : base + "/permanent.m3u"));
-        playUrlText.setText("Play URL: " + (base == null ? "--" : base + "/play"));
+        String streamPath = prefs.getString("streamPath", "/stream");
+        if (streamPath == null || streamPath.trim().isEmpty()) streamPath = "/stream";
+
+        long used = prefs.getLong("cacheUsed", 0);
+        long max = prefs.getLong("cacheMax", selectedCacheBytes());
+        String state = prefs.getString("status", "stopped");
+        statusText.setText("Status: " + state + "\nCache: " + humanBytes(used) + " / " + humanBytes(max));
+
+        String format = prefs.getString("format", "");
+        String contentType = prefs.getString("contentType", "application/octet-stream");
+        long sourceLength = prefs.getLong("sourceLength", -1);
+        boolean range = prefs.getBoolean("rangeSupported", false);
+
+        StringBuilder info = new StringBuilder("Source: ");
+        if (format != null && !format.isEmpty()) info.append(format).append(" • ");
+        if (sourceLength > 0) info.append(humanBytes(sourceLength)).append(" • ");
+        info.append(contentType == null ? "original media" : contentType);
+        if (state != null && state.startsWith("running")) {
+            info.append(" • Range: ").append(range ? "Yes" : "No");
+        }
+        sourceInfoText.setText(info.toString());
+
+        if (base == null) {
+            directUrlText.setText("Direct Stream URL: Connect phone to Wi-Fi");
+        } else {
+            directUrlText.setText("Direct Stream URL: " + base + streamPath);
+        }
     }
 
-    private void copyM3uUrl() {
+    private void copyDirectUrl() {
         String ip = NetworkUtils.getLocalIpv4();
         if (ip == null) {
             Toast.makeText(this, "Phone is not connected to a LAN/Wi-Fi network", Toast.LENGTH_SHORT).show();
             return;
         }
-        String url = "http://" + ip + ":" + RelayHttpServer.PORT + "/permanent.m3u";
+
+        String path = prefs.getString("streamPath", "/stream");
+        if (path == null || path.trim().isEmpty()) path = "/stream";
+        String url = "http://" + ip + ":" + RelayHttpServer.PORT + path;
+
         ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
-        if (cm != null) cm.setPrimaryClip(ClipData.newPlainText("Extreme Stream Relay M3U", url));
-        Toast.makeText(this, "M3U URL copied", Toast.LENGTH_SHORT).show();
+        if (cm != null) cm.setPrimaryClip(ClipData.newPlainText("Extreme Stream Relay direct URL", url));
+        Toast.makeText(this, "Direct stream URL copied", Toast.LENGTH_SHORT).show();
+    }
+
+    private String guessStreamPath(String url) {
+        String lower = url.toLowerCase(Locale.ROOT);
+        String noQuery = lower.split("\\?", 2)[0];
+        String[] exts = {"mkv", "mp4", "m4v", "webm", "avi", "mov", "m2ts", "ts", "mpg", "mpeg"};
+        for (String ext : exts) {
+            if (noQuery.endsWith("." + ext)) return "/stream." + ext;
+        }
+        return "/stream";
     }
 
     private String humanBytes(long b) {
-        if (b >= 1024L * 1024L * 1024L) return String.format("%.2f GB", b / (1024.0 * 1024.0 * 1024.0));
-        if (b >= 1024L * 1024L) return String.format("%.0f MB", b / (1024.0 * 1024.0));
+        if (b < 0) return "unknown";
+        if (b >= 1024L * 1024L * 1024L) {
+            return String.format(Locale.US, "%.2f GB", b / (1024.0 * 1024.0 * 1024.0));
+        }
+        if (b >= 1024L * 1024L) {
+            return String.format(Locale.US, "%.0f MB", b / (1024.0 * 1024.0));
+        }
+        if (b >= 1024L) {
+            return String.format(Locale.US, "%.0f KB", b / 1024.0);
+        }
         return b + " B";
     }
 }
