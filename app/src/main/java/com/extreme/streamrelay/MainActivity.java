@@ -113,9 +113,7 @@ public class MainActivity extends AppCompatActivity {
 
         String s = text.toString().trim();
         if (!isValidHttpUrl(s)) {
-            if (!auto) {
-                Toast.makeText(this, "Clipboard does not contain a valid HTTP/HTTPS URL", Toast.LENGTH_SHORT).show();
-            }
+            if (!auto) Toast.makeText(this, "Clipboard does not contain a valid HTTP/HTTPS URL", Toast.LENGTH_SHORT).show();
             return;
         }
 
@@ -195,13 +193,16 @@ public class MainActivity extends AppCompatActivity {
         String contentType = prefs.getString("contentType", "application/octet-stream");
         long sourceLength = prefs.getLong("sourceLength", -1);
         boolean range = prefs.getBoolean("rangeSupported", false);
+        String relayMode = prefs.getString("relayMode", range ? "Multi-thread Range" : "Sequential fallback");
 
         StringBuilder info = new StringBuilder("Source: ");
         if (format != null && !format.isEmpty()) info.append(format).append(" • ");
         if (sourceLength > 0) info.append(humanBytes(sourceLength)).append(" • ");
         info.append(contentType == null ? "original media" : contentType);
+
         if (state != null && state.startsWith("running")) {
-            info.append(" • Range: ").append(range ? "Yes" : "No");
+            info.append("\nMode: ").append(relayMode);
+            if (!range) info.append(" • large files supported • cache ≤ 2 GB");
         }
         sourceInfoText.setText(info.toString());
 
