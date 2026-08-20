@@ -10,6 +10,8 @@
 
     <application
         android:allowBackup="true"
+        android:icon="@drawable/ic_launcher"
+        android:roundIcon="@drawable/ic_launcher"
         android:label="Extreme Stream Relay"
         android:theme="@style/Theme.ExtremeStreamRelay"
         android:usesCleartextTraffic="true">
